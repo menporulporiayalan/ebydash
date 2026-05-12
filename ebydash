@@ -1,0 +1,1418 @@
+#!/usr/bin/env python3
+"""
+ebydash — LazyGit-inspired project dashboard.
+
+Usage : cd /your/project && ebydash
+Keys  : q=quit  r=refresh  1-7=jump to pane
+        Branches : Enter=checkout  n=new  p=pull  P=push  m=pull main
+        Files    : Space=stage/unstage  a=stage all  c=commit
+        VPN      : c=connect  d=disconnect
+        Spotify  : p=play/pause  n=next  b=prev
+"""
+from __future__ import annotations
+
+import json
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+try:
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Container, Vertical, VerticalScroll
+    from textual.widgets import Footer, Static, Input, Label
+    from textual.screen import ModalScreen
+    from textual import work
+    from textual.reactive import reactive
+    from textual.message import Message
+except ImportError:
+    print("textual required:\n  pip install --user --break-system-packages textual")
+    sys.exit(1)
+
+try:
+    from rich.markup import escape as rich_escape
+except ImportError:
+    def rich_escape(s: str) -> str:  # type: ignore[misc]
+        return s.replace("[", "\\[")
+
+
+# How often (seconds) each fetcher is allowed to re-run
+_INTERVALS: dict[str, float] = {
+    "status":   5,
+    "files":    5,
+    "branches": 5,
+    "spotify":  5,
+    "system":   20,
+    "vpn":      20,
+    "claude":   90,
+}
+REFRESH_INTERVAL = 5.0   # base timer tick
+
+
+# ── shell helpers ─────────────────────────────────────────────────────────────
+
+def shell(cmd: str, timeout: int = 10) -> tuple[str, int]:
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.stdout, r.returncode
+    except Exception:
+        return "", 1
+
+
+def shell_out(cmd: str, timeout: int = 60) -> tuple[str, int]:
+    """Run command; return combined stdout+stderr and returncode."""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout + r.stderr).strip(), r.returncode
+    except subprocess.TimeoutExpired:
+        return "timeout", 124
+    except Exception as e:
+        return str(e), 1
+
+
+def run_bg(fn: Any) -> None:
+    threading.Thread(target=fn, daemon=True).start()
+
+
+# ── age helper ────────────────────────────────────────────────────────────────
+
+def compact_age(rel: str) -> str:
+    m = re.match(r"(\d+)\s+(\w+)", rel.strip().lower())
+    if not m:
+        return "?"
+    n, u = int(m.group(1)), m.group(2)
+    for prefix, suffix in (
+        ("second", "s"), ("minute", "m"), ("hour", "h"),
+        ("day", "d"), ("week", "w"), ("month", "M"), ("year", "y"),
+    ):
+        if u.startswith(prefix):
+            return f"{n}{suffix}"
+    return "?"
+
+
+# ── data fetchers ─────────────────────────────────────────────────────────────
+
+def fetch_status() -> str:
+    root, rc = shell("git rev-parse --show-toplevel 2>/dev/null")
+    if rc != 0:
+        return "[bold red]✗ not a git repo[/bold red]"
+    repo = Path(root.strip()).name
+    branch, _ = shell("git branch --show-current 2>/dev/null")
+    branch = branch.strip() or "HEAD (detached)"
+    upstream, rc2 = shell(
+        "git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null"
+    )
+    upstream = upstream.strip()
+    ahead, _ = shell("git rev-list '@{u}..HEAD' --count 2>/dev/null")
+    behind, _ = shell("git rev-list 'HEAD..@{u}' --count 2>/dev/null")
+    ahead, behind = (ahead.strip() or "0"), (behind.strip() or "0")
+    line1 = (
+        f"[bold cyan]{repo}[/bold cyan] [dim]→[/dim] [bold yellow]{branch}[/bold yellow]"
+    )
+    if rc2 == 0 and upstream:
+        badges = ""
+        if ahead  != "0": badges += f" [bold green]↑{ahead}[/bold green]"
+        if behind != "0": badges += f" [bold red]↓{behind}[/bold red]"
+        line2 = f"[dim]{upstream}[/dim]{badges}"
+    else:
+        line2 = "[dim]no upstream[/dim]"
+    return f"{line1}\n{line2}"
+
+
+def fetch_branches_data() -> list[dict]:
+    # Use | as separator — \t becomes literal tab in the shell and IFS splits on it
+    out, rc = shell(
+        "git for-each-ref --sort=-committerdate "
+        "--format='%(refname:short)|%(committerdate:relative)|%(HEAD)|%(upstream:track)' "
+        "refs/heads/ 2>/dev/null"
+    )
+    if rc != 0:
+        return []
+    branches = []
+    for line in out.strip().splitlines():
+        parts = line.split("|", 3)
+        if len(parts) < 3:
+            continue
+        name       = parts[0].strip()
+        age_raw    = parts[1].strip()
+        is_current = parts[2].strip() == "*"
+        track      = parts[3].strip() if len(parts) > 3 else ""
+        age        = compact_age(age_raw) if not is_current else ""
+        if not track:                                 sync = "✓"
+        elif "gone" in track:                         sync = "✗"
+        elif "ahead" in track and "behind" in track:  sync = "↕"
+        elif "ahead" in track:                        sync = "↑"
+        elif "behind" in track:                       sync = "↓"
+        else:                                         sync = ""
+        branches.append(
+            {"name": name, "age": age, "is_current": is_current, "sync": sync}
+        )
+    return branches
+
+
+def fetch_files_data() -> list[dict]:
+    out, rc = shell("git status --porcelain 2>/dev/null")
+    if rc != 0:
+        return []
+    files = []
+    for line in out.splitlines():
+        if len(line) < 3:
+            continue
+        x, y, path = line[0], line[1], line[3:]
+        files.append({"x": x, "y": y, "path": path, "staged": x not in (" ", "?")})
+    return files
+
+
+def fetch_vpn_sessions() -> list[dict]:
+    out, rc = shell("openvpn3 sessions-list 2>/dev/null", timeout=5)
+    if rc != 0:
+        return []
+    text = out.strip()
+    if not text or "No sessions" in text:
+        return []
+    sessions: list[dict] = []
+    cur: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            if cur:
+                sessions.append(cur)
+            cur = {}
+            continue
+        if ":" in line:
+            k, _, v = line.partition(":")
+            k, v = k.strip().lower(), v.strip()
+            if   "session path" in k: cur["path"]   = v
+            elif "status"       in k: cur["status"] = v
+            elif "config name"  in k: cur["config"] = v
+            elif "device"       in k: cur["device"] = v
+    if cur:
+        sessions.append(cur)
+    return sessions
+
+
+def fetch_vpn_configs() -> list[str]:
+    out, rc = shell("openvpn3 configs-list 2>/dev/null", timeout=5)
+    if rc != 0:
+        return []
+    configs: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Config") or set(line) <= set("-= "):
+            continue
+        parts = line.split()
+        if parts:
+            c = parts[-1]
+            if not c.startswith("/") and c not in ("path", "name", "alias"):
+                configs.append(c)
+    return list(dict.fromkeys(configs))
+
+
+def fetch_system() -> str:
+    try:
+        import psutil
+    except ImportError:
+        return "[red]psutil not installed[/red]\n  pip install psutil"
+    try:
+        BAR = 18
+        def bar(pct: float, color: str) -> str:
+            filled = round(pct / 100 * BAR)
+            return f"[{color}]{'█' * filled}{'░' * (BAR - filled)}[/{color}]"
+        def pad_markup(text: str, width: int) -> str:
+            # Keep Rich markup untouched while padding based on visible width.
+            plain = re.sub(r"\[[^\]]+\]", "", text)
+            return text + " " * max(0, width - len(plain))
+
+        def join_cols(left: list[str], right: list[str], lw: int = 40) -> str:
+            h = max(len(left), len(right))
+            left = left + [""] * (h - len(left))
+            right = right + [""] * (h - len(right))
+            return "\n".join(f"{pad_markup(l, lw)}  {r}" for l, r in zip(left, right))
+
+        # ── CPU (compact summary) ────────────────────────────────────────────
+        cores = psutil.cpu_percent(interval=0.2, percpu=True)
+        cpu_pct = (sum(cores) / len(cores)) if cores else psutil.cpu_percent(interval=0.2)
+        c_cpu = "green" if cpu_pct < 60 else ("yellow" if cpu_pct < 85 else "red")
+        load = psutil.getloadavg()
+
+        # Show hottest cores only (top 3) to avoid long scrolling blocks.
+        hot = sorted(enumerate(cores), key=lambda kv: kv[1], reverse=True)[:3]
+        hot_line = "  ".join(
+            f"[dim]c{i}[/dim]:[{('green' if p < 60 else 'yellow' if p < 85 else 'red')}]{p:4.0f}%[/{('green' if p < 60 else 'yellow' if p < 85 else 'red')}]"
+            for i, p in hot
+        ) if hot else "[dim]n/a[/dim]"
+
+        left = [
+            "[bold dim]CPU[/bold dim]",
+            f"  {bar(cpu_pct, c_cpu)} [{c_cpu}]{cpu_pct:5.1f}%[/{c_cpu}]",
+            f"  [dim]load[/dim] [bold]{load[0]:.2f} {load[1]:.2f} {load[2]:.2f}[/bold]",
+            f"  {hot_line}",
+        ]
+
+        # ── Memory (compact summary) ─────────────────────────────────────────
+        m = psutil.virtual_memory()
+        ug = m.used / 1024**3
+        tg = m.total / 1024**3
+        c_mem = "green" if m.percent < 70 else ("yellow" if m.percent < 85 else "red")
+        right = [
+            "[bold dim]Memory[/bold dim]",
+            f"  {bar(m.percent, c_mem)} [{c_mem}]{m.percent:5.1f}%[/{c_mem}]",
+            f"  [dim]RAM[/dim] {ug:.1f}/{tg:.1f} GB",
+        ]
+
+        sw = psutil.swap_memory()
+        if sw.total:
+            sg = sw.used / 1024**3
+            stg = sw.total / 1024**3
+            c_sw = "green" if sw.percent < 50 else ("yellow" if sw.percent < 80 else "red")
+            right.append(f"  [dim]Swap[/dim] [{c_sw}]{sw.percent:4.0f}%[/{c_sw}] [dim]{sg:.1f}/{stg:.1f} GB[/dim]")
+        else:
+            right.append("  [dim]Swap[/dim] n/a")
+
+        return join_cols(left, right)
+    except Exception as e:
+        return f"[red]Error: {e}[/red]"
+
+
+_claude_cache: dict = {"mtime_key": None, "result": ""}
+
+
+def fetch_claude_stats() -> str:
+    """Parse JSONL session files to produce a /usage-style token+cost summary."""
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return "[dim]~/.claude/projects not found[/dim]"
+    try:
+        today_str = date.today().isoformat()
+
+        # Only re-parse if any JSONL file has changed since last run
+        mtime_key = (today_str, max(
+            (f.stat().st_mtime for f in projects_dir.glob("**/*.jsonl")),
+            default=0,
+        ))
+        if mtime_key == _claude_cache["mtime_key"] and _claude_cache["result"]:
+            return _claude_cache["result"]
+
+        # Aggregate per-project for today
+        by_project: dict[str, dict] = {}
+
+        for jsonl_file in projects_dir.glob("**/*.jsonl"):
+            proj_raw = jsonl_file.parent.name
+            # Derive a short readable project name
+            proj = (
+                proj_raw
+                .replace("-home-eby-Projects-", "")
+                .replace("-home-eby-Projects", "~")
+                .replace("-home-eby-", "~/")
+                .replace("-", "/", 1) if proj_raw.startswith("-home-eby-Projects-") else
+                proj_raw.replace("-home-eby-Projects", "Projects")
+                        .replace("-home-eby-", "~/")
+            )
+            if proj not in by_project:
+                by_project[proj] = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
+            t = by_project[proj]
+            for line in jsonl_file.read_text(errors="replace").splitlines():
+                try:
+                    obj = json.loads(line)
+                    if not obj.get("timestamp", "").startswith(today_str):
+                        continue
+                    msg = obj.get("message", {})
+                    if msg.get("role") != "assistant":
+                        continue
+                    usage = msg.get("usage", {})
+                    if not usage:
+                        continue
+                    t["input"]       += usage.get("input_tokens", 0)
+                    t["output"]      += usage.get("output_tokens", 0)
+                    t["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+                    t["cache_read"]  += usage.get("cache_read_input_tokens", 0)
+                except Exception:
+                    pass
+
+        # Drop projects with zero activity
+        by_project = {k: v for k, v in by_project.items()
+                      if any(v[f] for f in ("input", "output", "cache_write", "cache_read"))}
+
+        if not by_project:
+            return "[dim]No Claude usage today[/dim]"
+
+        def total_tokens(t: dict) -> int:
+            return t["input"] + t["output"] + t["cache_write"] + t["cache_read"]
+
+        def fmt_k(n: int) -> str:
+            return f"{n/1000:.1f}k" if n >= 1000 else str(n)
+
+        lines = ["[bold]Claude Usage — Today[/bold]", ""]
+
+        grand: dict = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
+
+        for proj, t in sorted(by_project.items(), key=lambda kv: total_tokens(kv[1]), reverse=True):
+            grand["input"]       += t["input"]
+            grand["output"]      += t["output"]
+            grand["cache_write"] += t["cache_write"]
+            grand["cache_read"]  += t["cache_read"]
+            lines.append(f"  [cyan]{proj[:28]:<28}[/cyan]  [dim]{fmt_k(total_tokens(t))} tok[/dim]")
+            lines.append(
+                f"    [dim]in[/dim] {fmt_k(t['input']):<6} "
+                f"[dim]out[/dim] {fmt_k(t['output']):<6} "
+                f"[dim]cache↑[/dim] {fmt_k(t['cache_write']):<6} "
+                f"[dim]cache↓[/dim] {fmt_k(t['cache_read'])}"
+            )
+
+        lines += [
+            "",
+            "[bold dim]" + "─" * 44 + "[/bold dim]",
+            f"  [bold]Total[/bold]  [bold green]{fmt_k(total_tokens(grand))} tokens[/bold green]",
+            f"    [dim]in[/dim] {fmt_k(grand['input']):<6} "
+            f"[dim]out[/dim] {fmt_k(grand['output']):<6} "
+            f"[dim]cache↑[/dim] {fmt_k(grand['cache_write']):<6} "
+            f"[dim]cache↓[/dim] {fmt_k(grand['cache_read'])}",
+        ]
+        result = "\n".join(lines)
+        _claude_cache["mtime_key"] = mtime_key
+        _claude_cache["result"]    = result
+        return result
+    except Exception as e:
+        return f"[red]Error: {e}[/red]"
+
+
+def fetch_spotify() -> dict:
+    """Return Spotify playback state — 2 subprocess calls total."""
+    # Single call: status + all metadata fields at once
+    meta_out, rc = shell(
+        "playerctl metadata --format "
+        "'{{status}}|||{{title}}|||{{artist}}|||{{album}}|||{{mpris:length}}'"
+        " 2>/dev/null",
+        timeout=4,
+    )
+    if rc != 0 or not meta_out.strip() or "No players" in meta_out:
+        return {"ok": False, "msg": "[dim]Spotify not running[/dim]"}
+
+    parts  = meta_out.strip().split("|||", 4)
+    status = parts[0].strip().lower() if parts else ""
+    title  = parts[1].strip()[:50]   if len(parts) > 1 else ""
+    artist = parts[2].strip()[:40]   if len(parts) > 2 else ""
+    album  = parts[3].strip()[:40]   if len(parts) > 3 else ""
+    raw_len = parts[4].strip()       if len(parts) > 4 else ""
+
+    # Second call: position (not available as metadata field)
+    pos_out, _ = shell("playerctl position 2>/dev/null", timeout=2)
+
+    def fmt(secs: float) -> str:
+        s = int(secs)
+        return f"{s // 60}:{s % 60:02d}"
+
+    try:
+        pos_str = fmt(float(pos_out.strip()))
+    except Exception:
+        pos_str = ""
+    try:
+        len_str = fmt(int(raw_len) / 1_000_000)
+    except Exception:
+        len_str = ""
+
+    return {
+        "ok":      True,
+        "playing": status == "playing",
+        "status":  status,
+        "title":   title,
+        "artist":  artist,
+        "album":   album,
+        "pos":     pos_str,
+        "length":  len_str,
+    }
+
+
+def fetch_diff(file_data: dict | None) -> str:
+    if not file_data:
+        return "[dim]  Select a file to preview diff[/dim]"
+    path   = file_data.get("path", "")
+    staged = file_data.get("staged", False)
+    x      = file_data.get("x", " ")
+    y      = file_data.get("y", " ")
+
+    if not path:
+        return "[dim]  No file selected[/dim]"
+
+    # Untracked file — show full content as additions
+    if x == "?" and y == "?":
+        out, rc = shell(f"cat -- {shlex.quote(path)} 2>/dev/null")
+        if rc != 0 or not out.strip():
+            return f"[dim]  {path} (untracked, unreadable)[/dim]"
+        lines = [f"[dim]  (untracked) {path}[/dim]", ""]
+        for line in out.splitlines()[:200]:
+            lines.append(f"[green]+  {rich_escape(line)}[/green]")
+        return "\n".join(lines)
+
+    # Staged diff
+    if staged:
+        out, rc = shell(f"git diff --cached -- {shlex.quote(path)} 2>/dev/null")
+    else:
+        out, rc = shell(f"git diff -- {shlex.quote(path)} 2>/dev/null")
+
+    if not out.strip():
+        # Could be a new staged file with no unstaged changes
+        out, rc = shell(f"git diff --cached -- {shlex.quote(path)} 2>/dev/null")
+
+    if not out.strip():
+        return f"[dim]  No diff available for {path}[/dim]"
+
+    lines = []
+    for line in out.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            lines.append(f"[bold dim]{rich_escape(line)}[/bold dim]")
+        elif line.startswith("+"):
+            lines.append(f"[green]{rich_escape(line)}[/green]")
+        elif line.startswith("-"):
+            lines.append(f"[red]{rich_escape(line)}[/red]")
+        elif line.startswith("@@"):
+            lines.append(f"[cyan]{rich_escape(line)}[/cyan]")
+        elif line.startswith("diff ") or line.startswith("index "):
+            lines.append(f"[dim]{rich_escape(line)}[/dim]")
+        else:
+            lines.append(rich_escape(line))
+    return "\n".join(lines)
+
+
+# ── Modal screens ─────────────────────────────────────────────────────────────
+
+class InputModal(ModalScreen):
+    CSS = """
+    InputModal { align: center middle; }
+    InputModal > Vertical {
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+        width: 60;
+        height: auto;
+    }
+    InputModal Label { margin-bottom: 1; color: $text-muted; }
+    """
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, prompt: str, placeholder: str = ""):
+        super().__init__()
+        self._prompt      = prompt
+        self._placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self._prompt)
+            yield Input(placeholder=self._placeholder)
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        val = event.value.strip()
+        self.dismiss(val if val else None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PickerModal(ModalScreen):
+    CSS = """
+    PickerModal { align: center middle; }
+    PickerModal > Vertical {
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+        width: 60;
+        height: auto;
+        max-height: 20;
+    }
+    PickerModal Label { margin-bottom: 1; color: $text-muted; }
+    """
+    BINDINGS = [
+        Binding("escape", "cancel",      "Cancel"),
+        Binding("up",     "cursor_up",   "Up"),
+        Binding("down",   "cursor_down", "Down"),
+        Binding("enter",  "select",      "Select"),
+    ]
+    cursor: reactive[int] = reactive(0)
+
+    def __init__(self, prompt: str, items: list[str]):
+        super().__init__()
+        self._prompt = prompt
+        self._items  = items
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self._prompt)
+            yield Static("", classes="picker-body")
+
+    def on_mount(self) -> None:
+        self._redraw()
+
+    def _redraw(self) -> None:
+        try:
+            body = self.query_one(".picker-body", Static)
+        except Exception:
+            return
+        body.update("\n".join(
+            f"[reverse] {item} [/reverse]" if i == self.cursor else f"  {item}"
+            for i, item in enumerate(self._items)
+        ))
+
+    def action_cursor_up(self) -> None:
+        if self.cursor > 0:
+            self.cursor -= 1
+            self._redraw()
+
+    def action_cursor_down(self) -> None:
+        if self.cursor < len(self._items) - 1:
+            self.cursor += 1
+            self._redraw()
+
+    def action_select(self) -> None:
+        if self._items:
+            self.dismiss(self._items[self.cursor])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Pane base ─────────────────────────────────────────────────────────────────
+
+class Pane(Vertical):
+    DEFAULT_CSS = """
+    Pane {
+        border: round #3a3f52;
+        background: #10131a;
+        height: 1fr;
+    }
+    Pane:focus-within {
+        border: round #7aa2f7;
+        tint: #0b1220 10%;
+    }
+    Pane .pt {
+        color: #a9b1d6;
+        background: #1a1f2b;
+        text-style: bold;
+        padding: 0 1 0 1;
+        height: 1;
+    }
+    """
+    _title: str = ""
+    can_focus = True
+
+    def title_bar(self) -> Label:
+        return Label(self._title, classes="pt")
+
+
+class PaneScroll(VerticalScroll):
+    """Scroll container used inside panes; excluded from tab focus chain."""
+    can_focus = False
+
+
+# ── Read-only panes ───────────────────────────────────────────────────────────
+
+class StatusPane(Pane):
+    _title = "[#7aa2f7][1][/#7aa2f7] STATUS"
+
+    def compose(self) -> ComposeResult:
+        yield self.title_bar()
+        with PaneScroll():
+            yield Static("loading…", classes="status-body")
+
+    def refresh_content(self, markup: str) -> None:
+        try:
+            self.query_one(".status-body", Static).update(markup)
+        except Exception:
+            pass
+
+
+class SystemPane(Pane):
+    _title = "[#7aa2f7][5][/#7aa2f7] SYSTEM"
+
+    def compose(self) -> ComposeResult:
+        yield self.title_bar()
+        with PaneScroll():
+            yield Static("loading…", classes="system-body")
+
+    def refresh_content(self, markup: str) -> None:
+        try:
+            self.query_one(".system-body", Static).update(markup)
+        except Exception:
+            pass
+
+
+class ClaudePane(Pane):
+    _title = "[#7aa2f7][7][/#7aa2f7] CLAUDE"
+
+    def compose(self) -> ComposeResult:
+        yield self.title_bar()
+        with PaneScroll():
+            yield Static("loading…", classes="claude-body")
+
+    def refresh_content(self, markup: str) -> None:
+        try:
+            self.query_one(".claude-body", Static).update(markup)
+        except Exception:
+            pass
+
+
+class DiffPane(Pane):
+    _title = "[#7aa2f7][0][/#7aa2f7] DIFF"
+
+    def compose(self) -> ComposeResult:
+        yield self.title_bar()
+        with PaneScroll():
+            yield Static("[dim]  Select a file to preview diff[/dim]", id="diff-body")
+
+    def refresh_content(self, markup: str) -> None:
+        try:
+            self.query_one("#diff-body", Static).update(markup)
+        except Exception:
+            pass
+
+
+class SpotifyPane(Pane):
+    _title = "[#7aa2f7][6][/#7aa2f7] SPOTIFY"
+    can_focus = True
+
+    BINDINGS = [
+        Binding("p", "play_pause", "Play/Pause"),
+        Binding("n", "next_track", "Next"),
+        Binding("b", "prev_track", "Prev"),
+    ]
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._playing = False
+        self._frame   = 0
+
+    def compose(self) -> ComposeResult:
+        yield self.title_bar()
+        yield Static("", id="sp-body")   # no VerticalScroll — fixed height widget
+
+    def on_mount(self) -> None:
+        # Animate the dots every 0.4 s (only cosmetic, no I/O)
+        self.set_interval(0.8, self._tick)
+
+    def _tick(self) -> None:
+        if self._playing:
+            self._frame = (self._frame + 1) % 8
+            try:
+                w = self.query_one("#sp-body", Static)
+                # Redraw only the dots line without a full refresh
+                self._draw(w, _dots_only=True)
+            except Exception:
+                pass
+
+    # ── render ─────────────────────────────────────────────────────────────────
+
+    def _progress_bar(self, pos: str, length: str, width: int = 28) -> str:
+        """Return a ─────●──── progress bar, or empty string if times unknown."""
+        def to_secs(t: str) -> int | None:
+            try:
+                m, s = t.split(":")
+                return int(m) * 60 + int(s)
+            except Exception:
+                return None
+        p, l = to_secs(pos), to_secs(length)
+        if p is None or l is None or l == 0:
+            return ""
+        ratio  = min(p / l, 1.0)
+        filled = round(ratio * width)
+        bar    = "─" * filled + "●" + "─" * (width - filled)
+        return f"[dim]{bar}[/dim]  [dim]{pos}/{length}[/dim]"
+
+    def _dots(self) -> str:
+        """Animated 8-dot pulse: ●●●·····  →  ·●●●····  → …"""
+        n = 3
+        dots = ["·"] * 8
+        for i in range(n):
+            dots[(self._frame + i) % 8] = "●"
+        return "".join(dots)
+
+    def _eq(self) -> str:
+        """Tiny animated equalizer used while playing."""
+        levels = [1, 3, 2, 4, 2, 3, 1, 4]
+        bars: list[str] = []
+        for i in range(6):
+            h = levels[(self._frame + i) % len(levels)]
+            bars.append("▁▂▃▄▅▆▇"[h])
+        return "[#7dcfff]" + "".join(bars) + "[/#7dcfff]"
+
+    def _draw(self, w: Static, _dots_only: bool = False) -> None:
+        # For dots-only tick we just patch the markup without a full rebuild
+        # (cheap — avoids re-reading _data on every frame)
+        if _dots_only:
+            # Re-render fully anyway — Static.update is cheap
+            pass
+        data    = getattr(self, "_data", {})
+        playing = self._playing
+        sc      = "#9ece6a" if playing else "#e0af68"
+        si      = "▶" if playing else "⏸"
+        status  = data.get("status", "…").capitalize()
+
+        if not data.get("ok"):
+            w.update(data.get("msg", ""))
+            return
+
+        title   = data.get("title",  "") or "Unknown title"
+        artist  = data.get("artist", "") or "Unknown artist"
+        album   = data.get("album",  "")
+        pos     = data.get("pos",    "")
+        length  = data.get("length", "")
+        bar     = self._progress_bar(pos, length)
+
+        state_badge = f"[{sc}]●[/{sc}] [bold]{si} {status}[/bold]"
+        lines = [
+            f" {state_badge}  [bold #c0caf5]{title}[/bold #c0caf5]",
+            f"    [#7aa2f7]{artist}[/#7aa2f7]",
+        ]
+        if album:
+            lines.append(f"    [dim]Album: {album}[/dim]")
+        lines.append("")
+        anim = self._eq() if playing else f"[dim]{self._dots()}[/dim]"
+        if bar:
+            lines.append(f"  {bar}")
+        else:
+            lines.append(f"  {anim}")
+        lines.append(
+            f"  {anim}   [dim]⏮[/dim] [bold]b[/bold]  [dim]⏯[/dim] [bold]p[/bold]  [dim]⏭[/dim] [bold]n[/bold]"
+        )
+        w.update("\n".join(lines))
+
+    def refresh_content(self, data: dict) -> None:
+        self._data    = data
+        self._playing = data.get("playing", False)
+        if not self._playing:
+            self._frame = 0
+        try:
+            self._draw(self.query_one("#sp-body", Static))
+        except Exception as e:
+            # Never leave the panel blank if markup/rendering fails.
+            try:
+                self.query_one("#sp-body", Static).update(f"[red]Spotify render error:[/red] {e}")
+            except Exception:
+                pass
+
+    # ── controls ───────────────────────────────────────────────────────────────
+
+    def _playerctl(self, cmd: str) -> None:
+        def do():
+            shell_out(f"playerctl -p spotify {cmd} 2>/dev/null || playerctl {cmd}")
+            self.app.call_from_thread(self.app.action_refresh)
+        run_bg(do)
+
+    def action_play_pause(self) -> None: self._playerctl("play-pause")
+    def action_next_track(self) -> None: self._playerctl("next")
+    def action_prev_track(self) -> None: self._playerctl("previous")
+
+
+# ── Branch pane ───────────────────────────────────────────────────────────────
+
+class BranchPane(Pane):
+    """Focusable pane — cursor state lives here, display is a plain Static."""
+
+    _title = "[#7aa2f7][3][/#7aa2f7] BRANCHES"
+    can_focus = True
+
+    BINDINGS = [
+        Binding("up",      "cursor_up",   "Up",       show=False),
+        Binding("down",    "cursor_down", "Down",     show=False),
+        Binding("enter",   "checkout",    "Checkout"),
+        Binding("n",       "new_branch",  "New"),
+        Binding("p",       "pull_branch", "Pull"),
+        Binding("shift+p", "push_branch", "Push"),
+        Binding("m",       "pull_main",   "↓main"),
+    ]
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._items: list[tuple[str, Any]] = []
+        self._cursor: int = 0
+
+    def compose(self) -> ComposeResult:
+        yield self.title_bar()
+        with PaneScroll():
+            yield Static("loading…", id="branch-body")
+
+    def _redraw(self) -> None:
+        lines = [
+            f"[reverse]{d}[/reverse]" if i == self._cursor else d
+            for i, (d, _) in enumerate(self._items)
+        ]
+        self.query_one("#branch-body", Static).update(
+            "\n".join(lines) if lines else "[dim]no branches[/dim]"
+        )
+
+    def refresh_content(self, branches: list[dict]) -> None:
+        items = []
+        for b in branches:
+            if b["is_current"]:
+                disp = f"[bold yellow]  * {b['name']}[/bold yellow]"
+            else:
+                age  = f"[dim]{b['age']:<4}[/dim]"
+                s    = b["sync"]
+                sync = (
+                    f" [green]{s}[/green]"   if s == "✓"        else
+                    f" [red]{s}[/red]"       if s in ("✗","↓")  else
+                    f" [yellow]{s}[/yellow]" if s               else ""
+                )
+                disp = f"{age} {b['name']}{sync}"
+            items.append((disp, b))
+        self._items = items
+        self._cursor = min(self._cursor, max(0, len(items) - 1))
+        self._redraw()
+
+    def action_cursor_up(self) -> None:
+        if self._cursor > 0:
+            self._cursor -= 1
+            self._redraw()
+            self._scroll_to_cursor()
+
+    def action_cursor_down(self) -> None:
+        if self._cursor < len(self._items) - 1:
+            self._cursor += 1
+            self._redraw()
+            self._scroll_to_cursor()
+
+    def _scroll_to_cursor(self) -> None:
+        try:
+            scroll = self.query_one("PaneScroll", PaneScroll)
+            target_y = self._cursor
+            scroll.scroll_to(y=target_y, animate=False)
+        except Exception:
+            pass
+
+    @property
+    def _selected(self) -> Any:
+        if self._items and 0 <= self._cursor < len(self._items):
+            return self._items[self._cursor][1]
+        return None
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _current_branch(self) -> str:
+        out, _ = shell("git branch --show-current 2>/dev/null")
+        return out.strip()
+
+    def _upstream_ref(self) -> str:
+        out, rc = shell("git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null")
+        return out.strip() if rc == 0 else ""
+
+    def _pick_remote(self) -> str:
+        # Prefer origin; otherwise first configured remote.
+        out, _ = shell("git remote 2>/dev/null")
+        remotes = [r.strip() for r in out.splitlines() if r.strip()]
+        if "origin" in remotes:
+            return "origin"
+        return remotes[0] if remotes else ""
+
+    def _msg(self, text: str, severity: str = "information") -> None:
+        self.app.call_from_thread(
+            lambda t=text, s=severity: self.app.notify(t, severity=s)
+        )
+
+    def _reload(self) -> None:
+        self.app.call_from_thread(self.app.action_refresh)
+
+    # ── actions ───────────────────────────────────────────────────────────────
+
+    def action_checkout(self) -> None:
+        b = self._selected
+        if not b:
+            return
+        if b["is_current"]:
+            self.app.notify("Already on this branch", severity="information")
+            return
+        name = b["name"]
+
+        # Immediate optimistic update — mark target as current right now
+        new_items = []
+        for disp, data in self._items:
+            if data["name"] == name:
+                new_items.append((
+                    f"[bold yellow]  * {name}[/bold yellow] [dim](switching…)[/dim]",
+                    {**data, "is_current": True},
+                ))
+            elif data.get("is_current"):
+                new_items.append((
+                    f"[dim]    {data['name']}[/dim]",
+                    {**data, "is_current": False},
+                ))
+            else:
+                new_items.append((disp, data))
+        self._items = new_items
+        self._redraw()
+
+        def do():
+            out, rc = shell_out(f"git checkout {shlex.quote(name)}")
+            if rc == 0:
+                self._msg(f"Switched to {name}")
+            else:
+                self._msg(f"Checkout failed: {out[:80]}", "error")
+            self._reload()   # full refresh regardless (fixes display if it failed)
+        run_bg(do)
+
+    def action_new_branch(self) -> None:
+        def on_name(name: str | None) -> None:
+            if not name:
+                return
+            def do():
+                out, rc = shell_out(f"git checkout -b {shlex.quote(name)}")
+                if rc == 0:
+                    self._msg(f"Created & switched to {name}")
+                    self._reload()
+                else:
+                    self._msg(f"Error: {out[:80]}", "error")
+            run_bg(do)
+        self.app.push_screen(InputModal("New branch name:", "feature/my-branch"), on_name)
+
+    def action_pull_branch(self) -> None:
+        branch = self._current_branch()
+        if not branch:
+            self.app.notify("Not on a named branch", severity="warning")
+            return
+        self.app.notify(f"Pulling {branch}…")
+        def do():
+            out, rc = shell_out(f"git pull origin {shlex.quote(branch)}")
+            if rc == 0:
+                self._msg(out.split("\n")[0][:100] or "Up to date")
+                self._reload()
+            else:
+                self._msg(f"Pull failed: {out[:80]}", "error")
+        run_bg(do)
+
+    def action_push_branch(self) -> None:
+        branch = self._current_branch()
+        if not branch:
+            self.app.notify("Not on a named branch", severity="warning")
+            return
+        self.app.notify(f"Pushing {branch}…")
+        def do():
+            upstream = self._upstream_ref()
+            if upstream:
+                out, rc = shell_out("git push")
+            else:
+                remote = self._pick_remote()
+                if not remote:
+                    self._msg("Push failed: no git remotes configured", "error")
+                    return
+                out, rc = shell_out(f"git push -u {shlex.quote(remote)} {shlex.quote(branch)}")
+            if rc == 0:
+                # git push output goes to stderr; grab a meaningful line
+                summary = next(
+                    (l for l in out.splitlines() if l.strip() and not l.startswith("remote:")),
+                    "Pushed",
+                )
+                self._msg(summary[:100] or "Pushed")
+                self._reload()
+            else:
+                self._msg(f"Push failed: {out[:120]}", "error")
+        run_bg(do)
+
+    def action_pull_main(self) -> None:
+        self.app.notify("Pulling main…")
+        def do():
+            out, rc = shell_out("git pull origin main")
+            if rc != 0 and "couldn't find remote ref main" in out.lower():
+                out, rc = shell_out("git pull origin master")
+            if rc == 0:
+                self._msg(out.split("\n")[0][:100] or "Up to date")
+                self._reload()
+            else:
+                self._msg(f"Pull failed: {out[:80]}", "error")
+        run_bg(do)
+
+
+# ── Files pane ────────────────────────────────────────────────────────────────
+
+class FilesPane(Pane):
+    """Focusable pane — cursor state lives here, display is a plain Static."""
+
+    _title = "[#7aa2f7][2][/#7aa2f7] FILES"
+    can_focus = True
+
+    BINDINGS = [
+        Binding("up",    "cursor_up",    "Up",          show=False),
+        Binding("down",  "cursor_down",  "Down",        show=False),
+        Binding("space", "toggle_stage", "Stage/Unstage"),
+        Binding("a",     "stage_all",    "Stage all"),
+        Binding("c",     "commit",       "Commit"),
+    ]
+
+    class FileSelected(Message):
+        def __init__(self, file_data: dict | None) -> None:
+            super().__init__()
+            self.file_data = file_data
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._items: list[tuple[str, Any]] = []
+        self._cursor: int = 0
+
+    def compose(self) -> ComposeResult:
+        yield self.title_bar()
+        with PaneScroll():
+            yield Static("loading…", id="files-body")
+
+    def _redraw(self) -> None:
+        lines = [
+            f"[reverse]{d}[/reverse]" if i == self._cursor else d
+            for i, (d, _) in enumerate(self._items)
+        ]
+        self.query_one("#files-body", Static).update(
+            "\n".join(lines) if lines else "[dim]no files[/dim]"
+        )
+
+    def _update_diff(self) -> None:
+        self.post_message(self.FileSelected(self._selected))
+
+    def refresh_content(self, files: list[dict]) -> None:
+        if not files:
+            self._items = [("[bold green]✓ working tree clean[/bold green]", None)]
+        else:
+            items = []
+            for f in files:
+                x, y, path = f["x"], f["y"], f["path"]
+                if x not in (" ", "?"):
+                    disp = f"[green]{x}{y}[/green] {path}"
+                elif y not in (" ", "?"):
+                    disp = f"[red] {y}[/red] {path}"
+                else:
+                    disp = f"[dim]??[/dim] {path}"
+                items.append((disp, f))
+            self._items = items
+        self._cursor = min(self._cursor, max(0, len(self._items) - 1))
+        self._redraw()
+        self._update_diff()
+
+    def action_cursor_up(self) -> None:
+        if self._cursor > 0:
+            self._cursor -= 1
+            self._redraw()
+            self._update_diff()
+            self._scroll_to_cursor()
+
+    def action_cursor_down(self) -> None:
+        if self._cursor < len(self._items) - 1:
+            self._cursor += 1
+            self._redraw()
+            self._update_diff()
+            self._scroll_to_cursor()
+
+    def _scroll_to_cursor(self) -> None:
+        try:
+            scroll = self.query_one("PaneScroll", PaneScroll)
+            target_y = self._cursor
+            scroll.scroll_to(y=target_y, animate=False)
+        except Exception:
+            pass
+
+    @property
+    def _selected(self) -> Any:
+        if self._items and 0 <= self._cursor < len(self._items):
+            return self._items[self._cursor][1]
+        return None
+
+    def _msg(self, text: str, severity: str = "information") -> None:
+        self.app.call_from_thread(
+            lambda t=text, s=severity: self.app.notify(t, severity=s)
+        )
+
+    def _reload(self) -> None:
+        self.app.call_from_thread(self.app.action_refresh)
+
+    def action_toggle_stage(self) -> None:
+        f = self._selected
+        if not f:
+            return
+        path, staged = f["path"], f["staged"]
+        def do():
+            if staged:
+                out, rc = shell_out(f"git restore --staged -- {shlex.quote(path)}")
+            else:
+                out, rc = shell_out(f"git add -- {shlex.quote(path)}")
+            if rc != 0:
+                self._msg(f"Error: {out[:80]}", "error")
+            self._reload()
+        run_bg(do)
+
+    def action_stage_all(self) -> None:
+        def do():
+            out, rc = shell_out("git add -A")
+            if rc == 0:
+                self._msg("All files staged")
+            else:
+                self._msg(f"Error: {out[:80]}", "error")
+            self._reload()
+        run_bg(do)
+
+    def action_commit(self) -> None:
+        staged, _ = shell("git diff --cached --name-only 2>/dev/null")
+        if not staged.strip():
+            self.app.notify("Nothing staged to commit", severity="warning")
+            return
+        def on_msg(msg: str | None) -> None:
+            if not msg:
+                return
+            def do():
+                out, rc = shell_out(f"git commit -m {shlex.quote(msg)}")
+                if rc == 0:
+                    self._msg(out.split("\n")[0][:100] or "Committed")
+                    self._reload()
+                else:
+                    self._msg(f"Commit failed: {out[:80]}", "error")
+            run_bg(do)
+        self.app.push_screen(InputModal("Commit message:", "feat: "), on_msg)
+
+
+# ── VPN pane ──────────────────────────────────────────────────────────────────
+
+class VPNPane(Pane):
+    _title = "[#7aa2f7][4][/#7aa2f7] VPN"
+
+    BINDINGS = [
+        Binding("c", "vpn_connect",    "Connect"),
+        Binding("d", "vpn_disconnect", "Disconnect"),
+    ]
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Store only plain data, never widget instances
+        self._sessions: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        yield self.title_bar()
+        with PaneScroll():
+            yield Static("loading…", classes="vpn-body")
+
+    def _body(self) -> Static | None:
+        try:
+            return self.query_one(".vpn-body", Static)
+        except Exception:
+            return None
+
+    def refresh_content(self, sessions: list[dict]) -> None:
+        self._sessions = sessions
+        body = self._body()
+        if body is None:
+            return
+        if not sessions:
+            body.update(
+                "[bold red]● Disconnected[/bold red]\n[dim]  c=connect[/dim]"
+            )
+            return
+        rows: list[str] = []
+        for s in sessions:
+            status = s.get("status", "unknown")
+            config = s.get("config", "?")
+            device = s.get("device", "")
+            if "connected" in status.lower():
+                rows.append("[bold green]● Connected[/bold green]")
+                rows.append(f"  Config: [cyan]{config}[/cyan]")
+                if device:
+                    rows.append(f"  Device: [dim]{device}[/dim]")
+                rows.append("[dim]  d=disconnect[/dim]")
+            elif "connecting" in status.lower():
+                rows.append("[bold yellow]● Connecting…[/bold yellow]")
+                rows.append(f"  [dim]{config}[/dim]")
+            else:
+                rows.append(f"[yellow]● {status}[/yellow]")
+                rows.append(f"  [dim]{config}[/dim]")
+        body.update("\n".join(rows))
+
+    def _msg(self, text: str, severity: str = "information") -> None:
+        self.app.call_from_thread(
+            lambda t=text, s=severity: self.app.notify(t, severity=s)
+        )
+
+    def _reload(self) -> None:
+        self.app.call_from_thread(self.app.action_refresh)
+
+    def action_vpn_connect(self) -> None:
+        self.app.notify("Connecting VPN…")
+        def do():
+            import os
+            autoload_dir = os.path.expanduser("~/.openvpn3/autoload")
+            out, rc = shell_out(
+                f"/usr/sbin/openvpn3-autoload --directory {shlex.quote(autoload_dir)}",
+                timeout=30,
+            )
+            if rc == 0:
+                self._msg("VPN Connected")
+            else:
+                self._msg(f"Connect failed: {out[:80]}", "error")
+            self._reload()
+        run_bg(do)
+
+    def action_vpn_disconnect(self) -> None:
+        if not self._sessions:
+            self.app.notify("Not connected", severity="information")
+            return
+        config = self._sessions[0].get("config", "")
+        if not config:
+            self.app.notify("No VPN config name found", severity="error")
+            return
+        self.app.notify("Disconnecting VPN…")
+        def do():
+            out, rc = shell_out(
+                f"openvpn3 session-manage --config {shlex.quote(config)} --disconnect",
+                timeout=15,
+            )
+            if rc == 0:
+                self._msg("VPN Disconnected")
+            else:
+                self._msg(f"Disconnect failed: {out[:80]}", "error")
+            self._reload()
+        run_bg(do)
+
+
+# ── Main App ──────────────────────────────────────────────────────────────────
+
+class PanelApp(App):
+    TITLE = "ebydash"
+
+    CSS = """
+    Screen {
+        layout: horizontal;
+        background: #0b0f14;
+        color: #c0caf5;
+    }
+    Footer {
+        background: #161b22;
+        color: #9aa5ce;
+    }
+    #left   {
+        width: 52;
+        layout: vertical;
+        padding: 0 1 1 1;
+    }
+    #right  {
+        width: 1fr;
+        layout: vertical;
+        padding: 0 1 1 0;
+    }
+    #status-pane   { height: 5;   }
+    #files-pane    { height: 2fr; }
+    #branches-pane { height: 2fr; }
+    #vpn-pane      { height: 7;   }
+    #diff-pane     { height: 3fr; }
+    #system-pane   { height: 2fr; }
+    #spotify-pane  { height: 2fr; }
+    #claude-pane   { height: 2fr; }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit",    "Quit"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("0", "focus_pane('diff-pane')",     show=False),
+        Binding("1", "focus_pane('status-pane')",   show=False),
+        Binding("2", "focus_pane('files-pane')",    show=False),
+        Binding("3", "focus_pane('branches-pane')", show=False),
+        Binding("4", "focus_pane('vpn-pane')",      show=False),
+        Binding("5", "focus_pane('system-pane')",   show=False),
+        Binding("6", "focus_pane('spotify-pane')",  show=False),
+        Binding("7", "focus_pane('claude-pane')",   show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="left"):
+            yield StatusPane(id="status-pane")
+            yield FilesPane(id="files-pane")
+            yield BranchPane(id="branches-pane")
+            yield VPNPane(id="vpn-pane")
+        with Container(id="right"):
+            yield DiffPane(id="diff-pane")
+            yield SystemPane(id="system-pane")
+            yield SpotifyPane(id="spotify-pane")
+            yield ClaudePane(id="claude-pane")
+        yield Footer()
+
+    # ── Fetcher registry ───────────────────────────────────────────────────────
+    _FETCHERS: dict = {
+        "status":   fetch_status,
+        "files":    fetch_files_data,
+        "branches": fetch_branches_data,
+        "system":   fetch_system,
+        "vpn":      fetch_vpn_sessions,
+        "spotify":  fetch_spotify,
+        "claude":   fetch_claude_stats,
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._pool        = ThreadPoolExecutor(max_workers=6)
+        self._cache: dict = {}          # last known values
+        self._last:  dict[str, float] = {}   # last fetch timestamps
+        self._diff_timer: threading.Timer | None = None
+
+    def on_mount(self) -> None:
+        self._do_refresh(force=True)
+        self.set_interval(REFRESH_INTERVAL, self._do_refresh)
+
+    @work(thread=True)
+    def _do_refresh(self, force: bool = False) -> None:
+        now = time.monotonic()
+
+        # Submit only fetchers that are due
+        futures = {
+            key: self._pool.submit(fn)
+            for key, fn in self._FETCHERS.items()
+            if force or now - self._last.get(key, 0) >= _INTERVALS.get(key, 5)
+        }
+
+        for key, fut in futures.items():
+            try:
+                self._cache[key] = fut.result()
+                self._last[key]  = now
+            except Exception:
+                pass  # keep stale cache value on error
+
+        data = self._cache
+
+        def apply() -> None:
+            if "status"   in futures: self.query_one("#status-pane",   StatusPane).refresh_content(data["status"])
+            if "files"    in futures: self.query_one("#files-pane",    FilesPane).refresh_content(data["files"])
+            if "branches" in futures: self.query_one("#branches-pane", BranchPane).refresh_content(data["branches"])
+            if "system"   in futures: self.query_one("#system-pane",   SystemPane).refresh_content(data["system"])
+            if "spotify"  in futures: self.query_one("#spotify-pane",  SpotifyPane).refresh_content(data["spotify"])
+            if "claude"   in futures: self.query_one("#claude-pane",   ClaudePane).refresh_content(data["claude"])
+            if "vpn"      in futures: self.query_one("#vpn-pane",      VPNPane).refresh_content(data["vpn"])
+
+        self.call_from_thread(apply)
+
+    def on_files_pane_file_selected(self, event: FilesPane.FileSelected) -> None:
+        """Debounced diff update — waits 150 ms after last cursor move."""
+        if self._diff_timer:
+            self._diff_timer.cancel()
+        file_data = event.file_data
+        def do():
+            markup = fetch_diff(file_data)
+            self.call_from_thread(
+                lambda m=markup: self.query_one("#diff-pane", DiffPane).refresh_content(m)
+            )
+        self._diff_timer = threading.Timer(0.15, do)
+        self._diff_timer.daemon = True
+        self._diff_timer.start()
+
+    def action_refresh(self) -> None:
+        self._do_refresh(force=True)   # force=True bypasses interval cache
+
+    def action_focus_pane(self, pane_id: str) -> None:
+        try:
+            pane = self.query_one(f"#{pane_id}")
+            # BranchPane/FilesPane are directly focusable; others focus VerticalScroll
+            if pane.can_focus:
+                pane.focus()
+            else:
+                pane.query_one(VerticalScroll).focus()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    PanelApp().run()
