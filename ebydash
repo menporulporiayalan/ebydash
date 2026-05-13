@@ -676,7 +676,7 @@ class DiffPane(Pane):
 
 
 class SpotifyPane(Pane):
-    _title = "[#7aa2f7][6][/#7aa2f7] SPOTIFY"
+    _title = "[#7aa2f7][6][/#7aa2f7] MEDIA"
     can_focus = True
 
     BINDINGS = [
